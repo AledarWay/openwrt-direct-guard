@@ -129,11 +129,47 @@ Options of `config global 'main'`:
 | `learn` | `1` | Learn the addresses of `domain` entries through dnsmasq. |
 | `dnsmasq_conf` | `/etc/dnsmasq.conf` | File that receives the managed dnsmasq block. |
 | `dnsmasq_restart` | `1` | Restart OpenWrt's dnsmasq when the block changes. |
+| `learn_via` | `dnsmasq` | Who learns domain addresses: `dnsmasq`, or `adguardhome` (see below). |
+| `agh_ipset_file` | `/etc/direct-guard/agh-ipset.conf` | File written for AdGuard Home's `dns.ipset_file`. |
+| `agh_restart` | `1` | Restart AdGuard Home when that file changes. |
+| `agh_restart_cmd` | empty | Command used instead of `/etc/init.d/adguardhome restart`, for example `podman restart adguardhome`. |
 | `snapshot_interval` | `60` | Seconds between saves of learned addresses (at least 10). |
 | `log` | `0` | Log rejected packets to the kernel log, at most 10 per minute, with the prefix `direct-guard: `. |
 
 Each `config target` section takes `domain` and `cidr` lists and an optional
 `enabled`. A domain covers its subdomains, and a leading `*.` is ignored.
+
+### AdGuard Home instead of dnsmasq-full
+
+If AdGuard Home answers your DNS and dnsmasq is disabled, set
+`learn_via` to `adguardhome`. AdGuard Home can only fill **ipsets**, not
+nftables sets, so this mode uses the `iptables` backend (`auto` picks it
+automatically) even on firewall4. Install `ipset`, `iptables-nft`,
+`ip6tables-nft` and `kmod-ipt-ipset`; `dnsmasq-full` is not needed.
+
+```sh
+uci set direct-guard.main.learn_via='adguardhome'
+uci commit direct-guard
+service direct-guard restart
+```
+
+Then point AdGuard Home at the generated file in `AdGuardHome.yaml` and
+restart it (needs AdGuard Home 0.107.13 or later):
+
+```yaml
+dns:
+  ipset_file: /etc/direct-guard/agh-ipset.conf
+```
+
+If AdGuard Home runs in a container, set `agh_ipset_file` to a path inside a
+volume you mount (for example `/data/adguardhome/conf/ipset.conf`), use the
+container's path for `ipset_file`, set `agh_restart_cmd`, and run it with
+`--network host` and `NET_ADMIN`.
+
+The sets `dg_learn4` and `dg_learn6` must exist before AdGuard Home adds to
+them, which is the case once `direct-guard` has been applied. The file is
+emptied, never deleted, when the guard is removed, so AdGuard Home keeps
+starting.
 
 ### Notes for proxies
 

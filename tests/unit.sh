@@ -168,6 +168,39 @@ dnsmasq_conf="$WORK/missing.conf"
 dnsmasq_sync "$WORK/empty"
 check_not "dnsmasq: no file is created for an empty block" test -e "$dnsmasq_conf"
 
+# AdGuard Home mode
+same "agh: learn_via defaults to dnsmasq" "$learn_via" dnsmasq
+same "agh: default ipset file" "$agh_ipset_file" /etc/direct-guard/agh-ipset.conf
+learn_via=adguardhome
+backend=auto
+select_backend 2>/dev/null
+same "agh: auto backend becomes iptables" "$backend" iptables
+backend=iptables
+same "agh: one ipset line per domain" "$(agh_render | tr '\n' ' ')" "example.com/dg_learn4,dg_learn6 example.net/dg_learn4,dg_learn6 "
+backend=nft
+same "agh: nothing with the nft backend" "$(agh_render 2>"$WORK/warnings")" ""
+check "agh: nft backend is reported" grep -q "ipsets only" "$WORK/warnings"
+backend=iptables
+learn=0
+same "agh: nothing when learning is off" "$(agh_render)" ""
+learn=1
+agh_ipset_file="$WORK/agh/ipset.conf"
+agh_render >"$WORK/agh.want"
+agh_sync "$WORK/agh.want"
+same "agh: file is created" "$agh_changed" 1
+same "agh: file content" "$(cat "$agh_ipset_file")" "$(cat "$WORK/agh.want")"
+agh_sync "$WORK/agh.want"
+same "agh: unchanged file is left alone" "$agh_changed" 0
+agh_sync "$WORK/empty"
+same "agh: file is emptied" "$agh_changed" 1
+check "agh: emptied file still exists" test -f "$agh_ipset_file"
+same "agh: emptied file has no lines" "$(wc -c <"$agh_ipset_file" | tr -d ' ')" 0
+agh_ipset_file="$WORK/agh/missing.conf"
+agh_sync "$WORK/empty"
+check_not "agh: no file is created for empty rules" test -e "$agh_ipset_file"
+learn_via=dnsmasq
+backend=nft
+
 out=$(sh "$SCRIPT" bogus 2>&1)
 same "unknown commands exit with 2" "$?" 2
 case "$out" in

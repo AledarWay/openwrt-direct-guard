@@ -1,0 +1,264 @@
+diff -ruN orig-dg/README.md openwrt-direct-guard-main/README.md
+--- orig-dg/README.md	2026-11-15 15:35:22.381459458 +0000
++++ openwrt-direct-guard-main/README.md	2026-11-15 15:52:02.361560447 +0000
+@@ -129,12 +129,48 @@
+ | `learn` | `1` | Learn the addresses of `domain` entries through dnsmasq. |
+ | `dnsmasq_conf` | `/etc/dnsmasq.conf` | File that receives the managed dnsmasq block. |
+ | `dnsmasq_restart` | `1` | Restart OpenWrt's dnsmasq when the block changes. |
++| `learn_via` | `dnsmasq` | Who learns domain addresses: `dnsmasq`, or `adguardhome` (see below). |
++| `agh_ipset_file` | `/etc/direct-guard/agh-ipset.conf` | File written for AdGuard Home's `dns.ipset_file`. |
++| `agh_restart` | `1` | Restart AdGuard Home when that file changes. |
++| `agh_restart_cmd` | empty | Command used instead of `/etc/init.d/adguardhome restart`, for example `podman restart adguardhome`. |
+ | `snapshot_interval` | `60` | Seconds between saves of learned addresses (at least 10). |
+ | `log` | `0` | Log rejected packets to the kernel log, at most 10 per minute, with the prefix `direct-guard: `. |
+ 
+ Each `config target` section takes `domain` and `cidr` lists and an optional
+ `enabled`. A domain covers its subdomains, and a leading `*.` is ignored.
+ 
++### AdGuard Home instead of dnsmasq-full
++
++If AdGuard Home answers your DNS and dnsmasq is disabled, set
++`learn_via` to `adguardhome`. AdGuard Home can only fill **ipsets**, not
++nftables sets, so this mode uses the `iptables` backend (`auto` picks it
++automatically) even on firewall4. Install `ipset`, `iptables-nft`,
++`ip6tables-nft` and `kmod-ipt-ipset`; `dnsmasq-full` is not needed.
++
++```sh
++uci set direct-guard.main.learn_via='adguardhome'
++uci commit direct-guard
++service direct-guard restart
++```
++
++Then point AdGuard Home at the generated file in `AdGuardHome.yaml` and
++restart it (needs AdGuard Home 0.107.13 or later):
++
++```yaml
++dns:
++  ipset_file: /etc/direct-guard/agh-ipset.conf
++```
++
++If AdGuard Home runs in a container, set `agh_ipset_file` to a path inside a
++volume you mount (for example `/data/adguardhome/conf/ipset.conf`), use the
++container's path for `ipset_file`, set `agh_restart_cmd`, and run it with
++`--network host` and `NET_ADMIN`.
++
++The sets `dg_learn4` and `dg_learn6` must exist before AdGuard Home adds to
++them, which is the case once `direct-guard` has been applied. The file is
++emptied, never deleted, when the guard is removed, so AdGuard Home keeps
++starting.
++
+ ### Notes for proxies
+ 
+ - **PassWall** (TPROXY or REDIRECT) works as is. Its own dnsmasq picks up the
+diff -ruN orig-dg/direct-guard/files/direct-guard.config openwrt-direct-guard-main/direct-guard/files/direct-guard.config
+--- orig-dg/direct-guard/files/direct-guard.config	2026-11-15 15:35:22.381509347 +0000
++++ openwrt-direct-guard-main/direct-guard/files/direct-guard.config	2026-11-15 15:52:02.361225866 +0000
+@@ -5,6 +5,10 @@
+ 	option learn '1'
+ 	option dnsmasq_conf '/etc/dnsmasq.conf'
+ 	option dnsmasq_restart '1'
++	option learn_via 'dnsmasq'
++	option agh_ipset_file '/etc/direct-guard/agh-ipset.conf'
++	option agh_restart '1'
++	option agh_restart_cmd ''
+ 	option snapshot_interval '60'
+ 	option log '0'
+ 
+diff -ruN orig-dg/direct-guard/files/direct-guard.sh openwrt-direct-guard-main/direct-guard/files/direct-guard.sh
+--- orig-dg/direct-guard/files/direct-guard.sh	2026-11-15 15:35:22.381531366 +0000
++++ openwrt-direct-guard-main/direct-guard/files/direct-guard.sh	2026-11-15 15:52:02.360927581 +0000
+@@ -8,6 +8,7 @@
+ LOCK_FILE=${DG_LOCK_FILE:-/var/lock/direct-guard.lock}
+ DNSMASQ_BIN=${DG_DNSMASQ_BIN:-dnsmasq}
+ DNSMASQ_INIT=${DG_DNSMASQ_INIT:-/etc/init.d/dnsmasq}
++AGH_INIT_DEFAULT=/etc/init.d/adguardhome
+ FW3=${DG_FW3:-/sbin/fw3}
+ FW4=${DG_FW4:-/sbin/fw4}
+ 
+@@ -127,12 +128,27 @@
+ 	learn=$(cfg main.learn)
+ 	dnsmasq_conf=$(cfg main.dnsmasq_conf)
+ 	dnsmasq_restart=$(cfg main.dnsmasq_restart)
++	learn_via=$(cfg main.learn_via)
++	agh_ipset_file=$(cfg main.agh_ipset_file)
++	agh_restart=$(cfg main.agh_restart)
++	agh_init=$(cfg main.agh_init)
++	agh_restart_cmd=$(cfg main.agh_restart_cmd)
+ 	interval=$(cfg main.snapshot_interval)
+ 	log_on=0
+ 	is_true "$(cfg main.log)" && log_on=1
+ 
+ 	: "${enabled:=0}" "${backend:=auto}" "${learn:=1}" "${dnsmasq_restart:=1}"
+ 	: "${dnsmasq_conf:=/etc/dnsmasq.conf}" "${interval:=60}"
++	: "${learn_via:=dnsmasq}" "${agh_restart:=1}"
++	: "${agh_ipset_file:=/etc/direct-guard/agh-ipset.conf}"
++	: "${agh_init:=$AGH_INIT_DEFAULT}"
++	case "$learn_via" in
++	dnsmasq | adguardhome) ;;
++	*)
++		warn "unknown learn_via '$learn_via' (use dnsmasq or adguardhome); using dnsmasq"
++		learn_via=dnsmasq
++		;;
++	esac
+ 	case "$interval" in
+ 	'' | *[!0-9]*) interval=60 ;;
+ 	esac
+@@ -184,7 +200,10 @@
+ 
+ select_backend() {
+ 	if [ "$backend" = auto ]; then
+-		if [ -x "$FW4" ]; then
++		if [ "$learn_via" = adguardhome ]; then
++			# AdGuard Home can only fill ipsets, not nftables sets
++			backend=iptables
++		elif [ -x "$FW4" ]; then
+ 			backend=nft
+ 		elif [ -x "$FW3" ]; then
+ 			backend=iptables
+@@ -194,6 +213,9 @@
+ 			backend=iptables
+ 		fi
+ 	fi
++	if [ "$learn_via" = adguardhome ] && [ "$backend" = nft ]; then
++		warn "AdGuard Home cannot fill nftables sets; domains are not learned (use backend iptables)"
++	fi
+ 	case "$backend" in
+ 	nft) need_cmd nft ;;
+ 	iptables) need_cmd iptables && need_cmd ipset ;;
+@@ -537,6 +559,58 @@
+ 	esac
+ }
+ 
++agh_render() {
++	local domain
++
++	is_true "$learn" || return 0
++	[ "$learn_via" = adguardhome ] || return 0
++	if [ "$backend" != iptables ]; then
++		warn "AdGuard Home fills ipsets only; domains are not learned with the $backend backend"
++		return 0
++	fi
++	# One line per domain, no blank lines or comments: AdGuard Home rejects them
++	for domain in $domains; do
++		printf '%s/%slearn4,%slearn6\n' "$domain" "$SET_PREFIX" "$SET_PREFIX"
++	done
++}
++
++# agh_sync FILE: install FILE as the AdGuard Home ipset_file. An empty FILE
++# empties an existing ipset_file but never deletes it, because AdGuard Home
++# fails to start when dns.ipset_file points to a missing file.
++agh_sync() {
++	local want="$1" conf="$agh_ipset_file"
++
++	agh_changed=0
++	if [ -f "$conf" ]; then
++		cmp -s "$conf" "$want" && return 0
++	else
++		[ -s "$want" ] || return 0
++	fi
++	mkdir -p "${conf%/*}" 2>/dev/null
++	write_file "$want" "$conf" || {
++		warn "cannot write $conf"
++		return 1
++	}
++	agh_changed=1
++}
++
++agh_reload() {
++	[ "$agh_changed" = 1 ] || return 0
++	if [ -n "${DG_NO_DNSMASQ_RESTART:-}" ] || ! is_true "$agh_restart"; then
++		msg "updated $agh_ipset_file; restart AdGuard Home to apply it"
++		return 0
++	fi
++	pidof AdGuardHome >/dev/null 2>&1 || return 0
++	if [ -n "$agh_restart_cmd" ]; then
++		# e.g. "podman restart adguardhome" when AdGuard Home runs in a container
++		# shellcheck disable=SC2086
++		(set -f && $agh_restart_cmd) >/dev/null 2>&1 || warn "failed to restart AdGuard Home with '$agh_restart_cmd'"
++		return 0
++	fi
++	[ -x "$agh_init" ] || return 0
++	"$agh_init" restart >/dev/null 2>&1 || warn "failed to restart AdGuard Home"
++}
++
+ dnsmasq_block() {
+ 	awk -v b="$BEGIN_MARK" -v e="$END_MARK" -v keep="$2" '
+ 		$0 == b { inside = 1; next }
+@@ -620,6 +694,7 @@
+ 	ipt_remove
+ 	: >"$tmpdir/dnsmasq.want"
+ 	dnsmasq_sync "$tmpdir/dnsmasq.want" && dnsmasq_reload
++	agh_sync "$tmpdir/dnsmasq.want" && agh_reload
+ 	return 0
+ }
+ 
+@@ -638,6 +713,14 @@
+ 	else
+ 		ipt_apply
+ 	fi || return 1
++	if [ "$learn_via" = adguardhome ]; then
++		# no dnsmasq block: remove one left over from the dnsmasq mode
++		: >"$tmpdir/dnsmasq.want"
++		dnsmasq_sync "$tmpdir/dnsmasq.want" && dnsmasq_reload
++		agh_render >"$tmpdir/agh.want"
++		agh_sync "$tmpdir/agh.want" && agh_reload
++		return 0
++	fi
+ 	dnsmasq_render >"$tmpdir/dnsmasq.want"
+ 	dnsmasq_sync "$tmpdir/dnsmasq.want" && dnsmasq_reload
+ 	return 0
+@@ -683,6 +766,11 @@
+ 	lines=0
+ 	[ -f "$dnsmasq_conf" ] && lines=$(dnsmasq_block "$dnsmasq_conf" inside | grep -cE '^(nftset|ipset)=')
+ 	printf 'dnsmasq:        %s domain rule(s) in %s\n' "$lines" "$dnsmasq_conf"
++	if [ "$learn_via" = adguardhome ]; then
++		lines=0
++		[ -f "$agh_ipset_file" ] && lines=$(grep -c . "$agh_ipset_file")
++		printf 'adguardhome:    %s domain rule(s) in %s\n' "$lines" "$agh_ipset_file"
++	fi
+ 	pgrep -f "$NAME watch" >/dev/null 2>&1 && watcher=yes
+ 	printf 'watcher:        %s\n' "$watcher"
+ }
+diff -ruN orig-dg/tests/unit.sh openwrt-direct-guard-main/tests/unit.sh
+--- orig-dg/tests/unit.sh	2026-11-15 15:35:22.381648072 +0000
++++ openwrt-direct-guard-main/tests/unit.sh	2026-11-15 15:35:29.210287987 +0000
+@@ -168,6 +168,39 @@
+ dnsmasq_sync "$WORK/empty"
+ check_not "dnsmasq: no file is created for an empty block" test -e "$dnsmasq_conf"
+ 
++# AdGuard Home mode
++same "agh: learn_via defaults to dnsmasq" "$learn_via" dnsmasq
++same "agh: default ipset file" "$agh_ipset_file" /etc/direct-guard/agh-ipset.conf
++learn_via=adguardhome
++backend=auto
++select_backend 2>/dev/null
++same "agh: auto backend becomes iptables" "$backend" iptables
++backend=iptables
++same "agh: one ipset line per domain" "$(agh_render | tr '\n' ' ')" "example.com/dg_learn4,dg_learn6 example.net/dg_learn4,dg_learn6 "
++backend=nft
++same "agh: nothing with the nft backend" "$(agh_render 2>"$WORK/warnings")" ""
++check "agh: nft backend is reported" grep -q "ipsets only" "$WORK/warnings"
++backend=iptables
++learn=0
++same "agh: nothing when learning is off" "$(agh_render)" ""
++learn=1
++agh_ipset_file="$WORK/agh/ipset.conf"
++agh_render >"$WORK/agh.want"
++agh_sync "$WORK/agh.want"
++same "agh: file is created" "$agh_changed" 1
++same "agh: file content" "$(cat "$agh_ipset_file")" "$(cat "$WORK/agh.want")"
++agh_sync "$WORK/agh.want"
++same "agh: unchanged file is left alone" "$agh_changed" 0
++agh_sync "$WORK/empty"
++same "agh: file is emptied" "$agh_changed" 1
++check "agh: emptied file still exists" test -f "$agh_ipset_file"
++same "agh: emptied file has no lines" "$(wc -c <"$agh_ipset_file" | tr -d ' ')" 0
++agh_ipset_file="$WORK/agh/missing.conf"
++agh_sync "$WORK/empty"
++check_not "agh: no file is created for empty rules" test -e "$agh_ipset_file"
++learn_via=dnsmasq
++backend=nft
++
+ out=$(sh "$SCRIPT" bogus 2>&1)
+ same "unknown commands exit with 2" "$?" 2
+ case "$out" in
